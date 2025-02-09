@@ -1,0 +1,115 @@
+// server.js
+
+const express = require("express");
+const axios = require("axios");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+const crypto = require("crypto");
+const path = require("path");
+
+const app = express();
+app.use(bodyParser.json());
+app.use(cors());
+app.use(express.static(path.join(__dirname, "public"))); // Serve frontend files
+
+// M-Pesa configuration
+const TILL_NUMBER = "3226372";
+const CONSUMER_KEY = "FzQTNp7PoxLyai6N5S3x1tzG7A8Ly3KQdn1256i6Pzw2U5g1";
+const CONSUMER_SECRET = "IktJD3AyOd2VOwirayQB3EGG4lmDxi7iaPlkFsci3QIG9LYsieKzfgqDfZKNGiV9";
+const SHORTCODE = "3226372";
+const PASSKEY = "YOUR_MPESA_PASSKEY_HERE";  // Update with your passkey
+const CALLBACK_URL = "https://deronconnectpay.com/api/mpesa-callback"; // Replace with your live URL
+
+let transactions = {}; // Store transactions temporarily
+
+// Get M-Pesa Access Token
+async function getAccessToken() {
+    const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString("base64");
+    const response = await axios.get("https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials", {
+        headers: { Authorization: `Basic ${auth}` }
+    });
+    return response.data.access_token;
+}
+
+// Generate a unique code for the transaction
+function generateUniqueCode() {
+    return crypto.randomBytes(4).toString("hex").toUpperCase();
+}
+
+// Endpoint to initiate the payment
+app.post("/api/initiate-payment", async (req, res) => {
+    const { phone, amount } = req.body;
+    if (!phone || !amount) return res.status(400).json({ success: false, message: "Invalid request" });
+    
+    try {
+        const token = await getAccessToken();
+        const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, "");
+        const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+        
+        const response = await axios.post(
+            "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+            {
+                BusinessShortCode: SHORTCODE,
+                Password: password,
+                Timestamp: timestamp,
+                TransactionType: "CustomerPayBillOnline",
+                Amount: amount,
+                PartyA: phone,
+                PartyB: SHORTCODE,
+                PhoneNumber: phone,
+                CallBackURL: CALLBACK_URL,
+                AccountReference: "WiFiPayment",
+                TransactionDesc: "WiFi Payment"
+            },
+            {
+                headers: { Authorization: `Bearer ${token}` }
+            }
+        );
+        
+        transactions[response.data.CheckoutRequestID] = { phone, amount, status: "pending" };
+        
+        res.json({ success: true, message: "Payment request sent", response: response.data });
+    } catch (error) {
+        res.status(500).json({ success: false, message: "Payment initiation failed", error: error.response?.data || error.message });
+    }
+});
+
+// M-Pesa callback endpoint
+app.post("/api/mpesa-callback", (req, res) => {
+    console.log("M-Pesa Callback Received:", req.body);
+    const { Body } = req.body;
+    if (Body?.stkCallback) {
+        const { CheckoutRequestID, ResultCode } = Body.stkCallback;
+        if (ResultCode === 0) {
+            const uniqueCode = generateUniqueCode();
+            transactions[CheckoutRequestID].status = "success";
+            transactions[CheckoutRequestID].uniqueCode = uniqueCode;
+            console.log(`Payment successful. Unique code generated: ${uniqueCode}`);
+        } else {
+            transactions[CheckoutRequestID].status = "failed";
+            console.log("Payment failed.");
+        }
+    }
+    res.json({ success: true, message: "Callback received" });
+});
+
+// Check the transaction status
+app.get("/api/check-transaction/:id", (req, res) => {
+    const { id } = req.params;
+    if (transactions[id]) {
+        res.json({ success: true, transaction: transactions[id] });
+    } else {
+        res.status(404).json({ success: false, message: "Transaction not found" });
+    }
+});
+
+// Serve the frontend files (index.html, script.js, styles.css)
+app.get("/", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// Start the server
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
